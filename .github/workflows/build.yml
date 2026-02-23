@@ -3,13 +3,13 @@ name: Auto Build and Release
 on:
   push:
     branches:
-      - 'main' 
+      - 'main'
     paths-ignore:
       - "README.md"
       - ".gitignore"
 
 permissions:
-  contents: write 
+  contents: write
   packages: write
 
 concurrency:
@@ -17,69 +17,77 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check-version:
-    name: Check Version & Commits
+  # -----------------------------------------------------------
+  # 1. 检测是否需要发布
+  # -----------------------------------------------------------
+  check-release:
+    name: Check Release Needed
     runs-on: ubuntu-latest
     outputs:
-      do_release: ${{ steps.check.outputs.do_release }}
-      new_version: ${{ steps.check.outputs.new_version }}
+      should_release: ${{ steps.check.outputs.should_release }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
       changelog: ${{ steps.changelog.outputs.content }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 
+          fetch-depth: 0
 
-      - name: Analyze Commits and Determine Version
+      - name: Check for feat/fix commits
         id: check
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          echo "Previous Tag: $PREV_TAG"
+          # 获取上一个 release 标签
+          PREV_TAG=$(git tag -l "release-*" --sort=-v:refname | head -1 || echo "")
+          echo "Previous Release Tag: $PREV_TAG"
           
-          VERSION_STR=${PREV_TAG#v}
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_STR"
-          
-          COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"%s")
-          echo "Commits since last tag:"
-          echo "$COMMITS"
-          
-          HAS_FEAT=$(echo "$COMMITS" | grep -iE "^feat(\(.*\))?:" || true)
-          HAS_FIX=$(echo "$COMMITS" | grep -iE "^fix(\(.*\))?:" || true)
-          
-          DO_RELEASE="false"
-          NEW_VERSION="$PREV_TAG"
-          
-          if [ -n "$HAS_FEAT" ]; then
-            NEW_MINOR=$((MINOR + 1))
-            NEW_VERSION="v${MAJOR}.${NEW_MINOR}.0"
-            DO_RELEASE="true"
-            echo "🚀 Detected FEAT: Bumping to $NEW_VERSION"
-          elif [ -n "$HAS_FIX" ]; then
-            NEW_PATCH=$((PATCH + 1))
-            NEW_VERSION="v${MAJOR}.${MINOR}.${NEW_PATCH}"
-            DO_RELEASE="true"
-            echo "🐛 Detected FIX: Bumping to $NEW_VERSION"
+          # 获取提交记录
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"%s")
           else
-            echo "⚠️ No feat or fix detected. Skipping release."
+            COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"%s")
           fi
           
-          echo "do_release=$DO_RELEASE" >> $GITHUB_OUTPUT
-          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "Recent commits:"
+          echo "$COMMITS"
+          
+          # 检测 feat 或 fix
+          HAS_CHANGE=$(echo "$COMMITS" | grep -iE "^(feat|fix)(\(.*\))?:" || true)
+          
+          if [ -n "$HAS_CHANGE" ]; then
+            echo "✅ Found feat/fix commits, will release"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+            
+            # 生成 release 标签 (release- 日期 - 短 hash)
+            SHORT_HASH=$(git rev-parse --short HEAD)
+            DATE=$(date +%Y%m%d)
+            RELEASE_TAG="release-${DATE}-${SHORT_HASH}"
+            echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+            echo "Release Tag: $RELEASE_TAG"
+          else
+            echo "⚠️ No feat/fix commits, skipping release"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Generate Changelog
         id: changelog
-        if: steps.check.outputs.do_release == 'true'
+        if: steps.check.outputs.should_release == 'true'
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          NEW_TAG="${{ steps.check.outputs.new_version }}"
+          PREV_TAG=$(git tag -l "release-*" --sort=-v:refname | head -1 || echo "")
           
-          echo "## 🚀 Release $NEW_TAG" > CHANGELOG.md
+          echo "## 🚀 Auto Release" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "**Tag:** ${{ steps.check.outputs.release_tag }}" >> CHANGELOG.md
+          echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S')" >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "### Changes" >> CHANGELOG.md
           echo "" >> CHANGELOG.md
           
           if [ -z "$PREV_TAG" ]; then
-            echo "🎉 首次发布" >> CHANGELOG.md
+            echo "🎉 Initial release" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
             git log --pretty=format:"- %s" >> CHANGELOG.md
           else
             echo "Changes since $PREV_TAG:" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
             git log ${PREV_TAG}..HEAD --pretty=format:"- %s" >> CHANGELOG.md
           fi
           
@@ -87,10 +95,13 @@ jobs:
           cat CHANGELOG.md >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+  # -----------------------------------------------------------
+  # 2. 构建任务 (仅当需要发布时运行)
+  # -----------------------------------------------------------
   build-android:
     name: Build Android
-    needs: check-version
-    if: needs.check-version.outputs.do_release == 'true'
+    needs: check-release
+    if: needs.check-release.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -111,8 +122,8 @@ jobs:
 
   build-windows:
     name: Build Windows
-    needs: check-version
-    if: needs.check-version.outputs.do_release == 'true'
+    needs: check-release
+    if: needs.check-release.outputs.should_release == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -130,8 +141,8 @@ jobs:
 
   build-linux:
     name: Build Linux (${{ matrix.arch }})
-    needs: check-version
-    if: needs.check-version.outputs.do_release == 'true'
+    needs: check-release
+    if: needs.check-release.outputs.should_release == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -159,8 +170,8 @@ jobs:
 
   build-macos:
     name: Build macOS
-    needs: check-version
-    if: needs.check-version.outputs.do_release == 'true'
+    needs: check-release
+    if: needs.check-release.outputs.should_release == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -183,16 +194,19 @@ jobs:
           name: macos-dmg
           path: ${{ steps.app_name.outputs.name }}.dmg
 
+  # -----------------------------------------------------------
+  # 3. 发布 (打标签 + 创建 Release)
+  # -----------------------------------------------------------
   publish:
-    name: Tag and Create Release
-    needs: [check-version, build-android, build-windows, build-linux, build-macos]
-    if: needs.check-version.outputs.do_release == 'true'
+    name: Create Release
+    needs: [check-release, build-android, build-windows, build-linux, build-macos]
+    if: needs.check-release.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }} 
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure Git
         run: |
@@ -220,16 +234,17 @@ jobs:
 
       - name: Create and Push Tag
         run: |
-          NEW_TAG="${{ needs.check-version.outputs.new_version }}"
-          echo "Creating tag: $NEW_TAG"
-          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
-          git push origin "$NEW_TAG"
+          RELEASE_TAG="${{ needs.check-release.outputs.release_tag }}"
+          echo "Creating tag: $RELEASE_TAG"
+          git tag -a "$RELEASE_TAG" -m "Auto release $RELEASE_TAG"
+          git push origin "$RELEASE_TAG"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ needs.check-version.outputs.new_version }}
-          body: ${{ needs.check-version.outputs.changelog }}
+          tag_name: ${{ needs.check-release.outputs.release_tag }}
+          name: "Auto Release ${{ needs.check-release.outputs.release_tag }}"
+          body: ${{ needs.check-release.outputs.changelog }}
           draft: false
           prerelease: false
           files: |
