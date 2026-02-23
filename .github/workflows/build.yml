@@ -26,7 +26,6 @@ jobs:
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
       release_tag: ${{ steps.check.outputs.release_tag }}
-      changelog: ${{ steps.changelog.outputs.content }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,33 +66,43 @@ jobs:
             echo "should_release=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Generate Changelog
-        id: changelog
+      # ✅ 修复：直接生成文件，不通过 output 传递大文本
+      - name: Generate Changelog File
         if: steps.check.outputs.should_release == 'true'
         run: |
           PREV_TAG=$(git tag -l "release-*" --sort=-v:refname | head -1 || echo "")
           
-          echo "## 🚀 Auto Release" > CHANGELOG.md
-          echo "" >> CHANGELOG.md
-          echo "**Tag:** ${{ steps.check.outputs.release_tag }}" >> CHANGELOG.md
-          echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S')" >> CHANGELOG.md
-          echo "" >> CHANGELOG.md
-          echo "### Changes" >> CHANGELOG.md
-          echo "" >> CHANGELOG.md
+          {
+            echo "## 🚀 Auto Release"
+            echo ""
+            echo "**Tag:** ${{ steps.check.outputs.release_tag }}"
+            echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "### Changes"
+            echo ""
+            
+            if [ -z "$PREV_TAG" ]; then
+              echo "🎉 Initial release"
+              echo ""
+              git log --pretty=format:"- %s"
+            else
+              echo "Changes since $PREV_TAG:"
+              echo ""
+              git log ${PREV_TAG}..HEAD --pretty=format:"- %s"
+            fi
+          } > CHANGELOG.md
           
-          if [ -z "$PREV_TAG" ]; then
-            echo "🎉 Initial release" >> CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            git log --pretty=format:"- %s" >> CHANGELOG.md
-          else
-            echo "Changes since $PREV_TAG:" >> CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            git log ${PREV_TAG}..HEAD --pretty=format:"- %s" >> CHANGELOG.md
-          fi
-          
-          echo "content<<EOF" >> $GITHUB_OUTPUT
-          cat CHANGELOG.md >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "📄 Changelog generated:"
+          cat CHANGELOG.md
+
+      # ✅ 修复：上传 changelog 作为 artifact 供后续步骤下载
+      - name: Upload Changelog
+        if: steps.check.outputs.should_release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog-file
+          path: CHANGELOG.md
+          retention-days: 1
 
   # -----------------------------------------------------------
   # 2. 构建任务 (仅当需要发布时运行)
@@ -213,6 +222,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+      # ✅ 修复：下载 changelog 文件
+      - name: Download Changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: changelog-file
+          path: ./
+
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -244,7 +260,7 @@ jobs:
         with:
           tag_name: ${{ needs.check-release.outputs.release_tag }}
           name: "Auto Release ${{ needs.check-release.outputs.release_tag }}"
-          body: ${{ needs.check-release.outputs.changelog }}
+          body_path: CHANGELOG.md  # ✅ 修复：直接读取文件
           draft: false
           prerelease: false
           files: |
