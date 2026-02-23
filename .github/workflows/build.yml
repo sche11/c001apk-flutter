@@ -1,143 +1,238 @@
-name: Build
+name: Auto Build and Release
 
 on:
   push:
+    branches:
+      - 'main' 
     paths-ignore:
       - "README.md"
+      - ".gitignore"
+
+permissions:
+  contents: write 
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  check-version:
+    name: Check Version & Commits
+    runs-on: ubuntu-latest
+    outputs:
+      do_release: ${{ steps.check.outputs.do_release }}
+      new_version: ${{ steps.check.outputs.new_version }}
+      changelog: ${{ steps.changelog.outputs.content }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: Analyze Commits and Determine Version
+        id: check
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Previous Tag: $PREV_TAG"
+          
+          VERSION_STR=${PREV_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_STR"
+          
+          COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"%s")
+          echo "Commits since last tag:"
+          echo "$COMMITS"
+          
+          HAS_FEAT=$(echo "$COMMITS" | grep -iE "^feat(\(.*\))?:" || true)
+          HAS_FIX=$(echo "$COMMITS" | grep -iE "^fix(\(.*\))?:" || true)
+          
+          DO_RELEASE="false"
+          NEW_VERSION="$PREV_TAG"
+          
+          if [ -n "$HAS_FEAT" ]; then
+            NEW_MINOR=$((MINOR + 1))
+            NEW_VERSION="v${MAJOR}.${NEW_MINOR}.0"
+            DO_RELEASE="true"
+            echo "🚀 Detected FEAT: Bumping to $NEW_VERSION"
+          elif [ -n "$HAS_FIX" ]; then
+            NEW_PATCH=$((PATCH + 1))
+            NEW_VERSION="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+            DO_RELEASE="true"
+            echo "🐛 Detected FIX: Bumping to $NEW_VERSION"
+          else
+            echo "⚠️ No feat or fix detected. Skipping release."
+          fi
+          
+          echo "do_release=$DO_RELEASE" >> $GITHUB_OUTPUT
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate Changelog
+        id: changelog
+        if: steps.check.outputs.do_release == 'true'
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          NEW_TAG="${{ steps.check.outputs.new_version }}"
+          
+          echo "## 🚀 Release $NEW_TAG" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          
+          if [ -z "$PREV_TAG" ]; then
+            echo "🎉 首次发布" >> CHANGELOG.md
+            git log --pretty=format:"- %s" >> CHANGELOG.md
+          else
+            echo "Changes since $PREV_TAG:" >> CHANGELOG.md
+            git log ${PREV_TAG}..HEAD --pretty=format:"- %s" >> CHANGELOG.md
+          fi
+          
+          echo "content<<EOF" >> $GITHUB_OUTPUT
+          cat CHANGELOG.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
   build-android:
     name: Build Android
+    needs: check-version
+    if: needs.check-version.outputs.do_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@v3
         with:
+          channel: 'stable'
           cache: true
-
       - uses: actions/setup-java@v4
         with:
           java-version: 17
           distribution: "temurin"
-
-      - name: Install dependencies
-        run: flutter pub get
-
-      - name: Build APKs
-        run: flutter build apk --release --split-per-abi
-
-      - name: Upload ARM64 APK
-        uses: actions/upload-artifact@v4
+      - run: flutter pub get
+      - run: flutter build apk --release --split-per-abi
+      - uses: actions/upload-artifact@v4
         with:
-          name: Android ARM64
-          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
-
-      - name: Upload ARM32 APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Android ARM32
-          path: build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
-
-      - name: Upload x86-64 APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Android x86-64
-          path: build/app/outputs/flutter-apk/app-x86_64-release.apk
+          name: android-apks
+          path: build/app/outputs/flutter-apk/*.apk
 
   build-windows:
     name: Build Windows
+    needs: check-version
+    if: needs.check-version.outputs.do_release == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@v3
         with:
+          channel: 'stable'
           cache: true
-
-      - name: Install dependencies
-        run: flutter pub get
-
-      - name: Build
-        run: flutter build windows --release
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - run: flutter pub get
+      - run: flutter build windows --release
+      - uses: actions/upload-artifact@v4
         with:
-          name: Windows
+          name: windows-build
           path: build/windows/x64/runner/Release/
           compression-level: 9
 
-  build-linux-x64:
-    name: Build Linux x86-64
-    runs-on: ubuntu-22.04
+  build-linux:
+    name: Build Linux (${{ matrix.arch }})
+    needs: check-version
+    if: needs.check-version.outputs.do_release == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@v3
         with:
+          channel: 'stable'
           cache: true
-
-      - name: Install dependencies
-        run: |
+      - run: |
           sudo apt update -y
-          sudo apt install -y libgtk-3-dev
+          sudo apt install -y libgtk-3-dev libblkid-dev liblzma-dev ninja-build clang cmake
           flutter pub get
-
-      - name: Build
-        run: flutter build linux --release
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - run: flutter build linux --release
+      - uses: actions/upload-artifact@v4
         with:
-          name: Linux x86-64
-          path: build/linux/x64/release/bundle/
-          compression-level: 9
-
-  build-linux-arm64:
-    name: Build Linux ARM64
-    runs-on: ubuntu-22.04-arm
-    steps:
-      - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: main
-          cache: true
-
-      - name: Install dependencies
-        run: |
-          sudo apt update -y
-          sudo apt install -y libgtk-3-dev
-          flutter pub get
-
-      - name: Build
-        run: flutter build linux --release
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: Linux ARM64
-          path: build/linux/arm64/release/bundle/
+          name: linux-${{ matrix.arch }}-build
+          path: build/linux/${{ matrix.arch }}/release/bundle/
           compression-level: 9
 
   build-macos:
     name: Build macOS
+    needs: check-version
+    if: needs.check-version.outputs.do_release == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@v3
         with:
+          channel: 'stable'
           cache: true
-
-      - name: Install dependencies
-        run: flutter pub get
-
-      - name: Build
-        run: flutter build macos --release
-
-      - name: Create Apple Disk Image (.dmg)
+      - run: flutter pub get
+      - run: flutter build macos --release
+      - name: Get App Name
+        id: app_name
         run: |
-          hdiutil create -format UDZO -srcfolder build/macos/Build/Products/Release/c001apk-flutter.app c001apk.dmg
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
+          NAME=$(grep "^name:" pubspec.yaml | head -1 | awk '{print $2}')
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+      - name: Create DMG
+        run: |
+          hdiutil create -format UDZO -srcfolder "build/macos/Build/Products/Release/${{ steps.app_name.outputs.name }}.app" ${{ steps.app_name.outputs.name }}.dmg
+      - uses: actions/upload-artifact@v4
         with:
-          name: macOS
-          path: c001apk.dmg
+          name: macos-dmg
+          path: ${{ steps.app_name.outputs.name }}.dmg
+
+  publish:
+    name: Tag and Create Release
+    needs: [check-version, build-android, build-windows, build-linux, build-macos]
+    if: needs.check-version.outputs.do_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }} 
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Prepare Desktop Files (Zip)
+        run: |
+          cd ./artifacts
+          zip_folder() {
+            if [ -d "$1" ]; then
+              cd "$1" && zip -r "../$1.zip" . && cd ..
+              rm -rf "$1"
+            fi
+          }
+          zip_folder "windows-build"
+          zip_folder "linux-x64-build"
+          zip_folder "linux-arm64-build"
+          cd ..
+
+      - name: Create and Push Tag
+        run: |
+          NEW_TAG="${{ needs.check-version.outputs.new_version }}"
+          echo "Creating tag: $NEW_TAG"
+          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
+          git push origin "$NEW_TAG"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.check-version.outputs.new_version }}
+          body: ${{ needs.check-version.outputs.changelog }}
+          draft: false
+          prerelease: false
+          files: |
+            ./artifacts/**/*.apk
+            ./artifacts/**/*.zip
+            ./artifacts/**/*.dmg
